@@ -119,6 +119,37 @@ const SCHEMA = `
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS accounts (
+    profile_id TEXT PRIMARY KEY REFERENCES profiles(id) ON DELETE CASCADE,
+    username TEXT NOT NULL,
+    username_norm TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    totp_secret TEXT,
+    totp_pending_secret TEXT,
+    totp_enabled INTEGER NOT NULL DEFAULT 0,
+    failed_attempts INTEGER NOT NULL DEFAULT 0,
+    locked_until INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS sessions (
+    token_hash TEXT PRIMARY KEY,
+    profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    last_seen_at INTEGER NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_sessions_profile ON sessions(profile_id);
+
+  CREATE TABLE IF NOT EXISTS recovery_codes (
+    profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+    code_hash TEXT NOT NULL,
+    used_at INTEGER,
+    PRIMARY KEY (profile_id, code_hash)
+  );
 `;
 
 function cloneDefaultSettings() {
@@ -291,6 +322,28 @@ function rowToTransaction(row) {
   };
 }
 
+function rowToAccount(row) {
+  if (!row) return null;
+  return {
+    profileId: row.profile_id,
+    username: row.username,
+    usernameNorm: row.username_norm,
+    passwordHash: row.password_hash,
+    totpSecret: row.totp_secret ?? null,
+    totpPendingSecret: row.totp_pending_secret ?? null,
+    totpEnabled: Boolean(row.totp_enabled),
+    failedAttempts: Number(row.failed_attempts ?? 0),
+    lockedUntil: Number(row.locked_until ?? 0),
+  };
+}
+
+/** Bloqueo progresivo: 1, 2, 4, 8 y hasta 15 minutos tras cada fallo. */
+export function lockDurationMs(failedAttempts) {
+  if (failedAttempts < 5) return 0;
+  const minutes = Math.min(2 ** (failedAttempts - 5), 15);
+  return minutes * 60 * 1000;
+}
+
 export function createRepository(filePath) {
   const db = new DatabaseSync(filePath);
   db.exec('PRAGMA journal_mode = WAL;');
@@ -346,6 +399,75 @@ export function createRepository(filePath) {
         (profile_id, id, type, amount, category, date, description, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `),
+
+    listAccountSummaries: db.prepare(`
+      SELECT p.id, p.name, p.color, p.created_at,
+             a.username, a.totp_enabled, a.locked_until,
+             CASE WHEN a.profile_id IS NULL THEN 0 ELSE 1 END AS has_account
+      FROM profiles p
+      LEFT JOIN accounts a ON a.profile_id = p.id
+      ORDER BY p.created_at ASC
+    `),
+    getAccount: db.prepare('SELECT * FROM accounts WHERE profile_id = ?'),
+    getAccountByUsername: db.prepare('SELECT * FROM accounts WHERE username_norm = ?'),
+    insertAccount: db.prepare(`
+      INSERT INTO accounts
+        (profile_id, username, username_norm, password_hash, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `),
+    updatePassword: db.prepare(
+      'UPDATE accounts SET password_hash = ?, failed_attempts = 0, locked_until = 0, updated_at = ? WHERE profile_id = ?',
+    ),
+    setPendingTotp: db.prepare(
+      'UPDATE accounts SET totp_pending_secret = ?, updated_at = ? WHERE profile_id = ?',
+    ),
+    enableTotp: db.prepare(`
+      UPDATE accounts
+      SET totp_secret = totp_pending_secret, totp_pending_secret = NULL,
+          totp_enabled = 1, updated_at = ?
+      WHERE profile_id = ? AND totp_pending_secret IS NOT NULL
+    `),
+    disableTotp: db.prepare(`
+      UPDATE accounts
+      SET totp_secret = NULL, totp_pending_secret = NULL,
+          totp_enabled = 0, updated_at = ?
+      WHERE profile_id = ?
+    `),
+    registerFailure: db.prepare(`
+      UPDATE accounts
+      SET failed_attempts = failed_attempts + 1, updated_at = ?
+      WHERE profile_id = ?
+    `),
+    setLock: db.prepare(
+      'UPDATE accounts SET locked_until = ?, updated_at = ? WHERE profile_id = ?',
+    ),
+    resetFailures: db.prepare(
+      'UPDATE accounts SET failed_attempts = 0, locked_until = 0, updated_at = ? WHERE profile_id = ?',
+    ),
+
+    insertSession: db.prepare(`
+      INSERT INTO sessions (token_hash, profile_id, created_at, expires_at, last_seen_at)
+      VALUES (?, ?, ?, ?, ?)
+    `),
+    getSession: db.prepare('SELECT * FROM sessions WHERE token_hash = ?'),
+    touchSession: db.prepare('UPDATE sessions SET last_seen_at = ? WHERE token_hash = ?'),
+    deleteSession: db.prepare('DELETE FROM sessions WHERE token_hash = ?'),
+    deleteSessionsForProfile: db.prepare('DELETE FROM sessions WHERE profile_id = ?'),
+    deleteOtherSessions: db.prepare(
+      'DELETE FROM sessions WHERE profile_id = ? AND token_hash <> ?',
+    ),
+    deleteExpiredSessions: db.prepare('DELETE FROM sessions WHERE expires_at <= ?'),
+
+    deleteRecoveryCodes: db.prepare('DELETE FROM recovery_codes WHERE profile_id = ?'),
+    insertRecoveryCode: db.prepare(
+      'INSERT INTO recovery_codes (profile_id, code_hash) VALUES (?, ?)',
+    ),
+    useRecoveryCode: db.prepare(
+      'UPDATE recovery_codes SET used_at = ? WHERE profile_id = ? AND code_hash = ? AND used_at IS NULL',
+    ),
+    countRecoveryCodes: db.prepare(
+      'SELECT COUNT(*) AS total FROM recovery_codes WHERE profile_id = ? AND used_at IS NULL',
+    ),
   };
 
   function transaction(fn) {
@@ -610,6 +732,243 @@ export function createRepository(filePath) {
     return getWorkspace();
   }
 
+  /* ---------------------------------------------------------------- */
+  /* Cuentas, sesiones y 2FA                                           */
+  /* ---------------------------------------------------------------- */
+
+  function getAccount(profileId) {
+    return rowToAccount(statements.getAccount.get(profileId));
+  }
+
+  function getAccountByUsername(usernameNorm) {
+    return rowToAccount(statements.getAccountByUsername.get(usernameNorm));
+  }
+
+  function listAccountSummaries() {
+    return statements.listAccountSummaries.all().map((row) => ({
+      id: row.id,
+      name: row.name,
+      color: row.color,
+      createdAt: row.created_at,
+      username: row.username ?? null,
+      hasPassword: Boolean(row.has_account),
+      totpEnabled: Boolean(row.totp_enabled),
+      lockedUntil: Number(row.locked_until ?? 0),
+    }));
+  }
+
+  function assertUsernameAvailable(usernameNorm) {
+    if (statements.getAccountByUsername.get(usernameNorm)) {
+      throw new HttpError(409, 'Ese nombre de usuario ya está en uso.');
+    }
+  }
+
+  function createAccount(input) {
+    const profileId = input?.profileId;
+    const username = input?.username;
+    const usernameNorm = input?.usernameNorm;
+    const passwordHash = input?.passwordHash;
+
+    if (!statements.getProfile.get(profileId)) {
+      throw new HttpError(404, 'Perfil no encontrado.');
+    }
+    if (statements.getAccount.get(profileId)) {
+      throw new HttpError(409, 'Ese perfil ya tiene credenciales de acceso.');
+    }
+    assertUsernameAvailable(usernameNorm);
+
+    const now = Date.now();
+    statements.insertAccount.run(profileId, username, usernameNorm, passwordHash, now, now);
+    return rowToAccount(statements.getAccount.get(profileId));
+  }
+
+  /** Crea perfil + ajustes + credenciales en una sola transacción. */
+  function createProfileWithAccount(input) {
+    const profile = sanitizeProfile(
+      {
+        id: input?.id,
+        name: input?.name,
+        color: input?.color,
+        createdAt: input?.createdAt,
+      },
+      countProfiles(),
+    );
+    if (!profile) {
+      throw new HttpError(400, 'El nombre del perfil es obligatorio.');
+    }
+    if (statements.getProfile.get(profile.id)) {
+      throw new HttpError(409, 'Ya existe un perfil con ese identificador.');
+    }
+
+    const normalizedName = profile.name.toLocaleLowerCase('es');
+    if (
+      statements.listProfiles
+        .all()
+        .some((user) => user.name.toLocaleLowerCase('es') === normalizedName)
+    ) {
+      throw new HttpError(409, 'Ya existe un perfil con ese nombre.');
+    }
+
+    assertUsernameAvailable(input?.usernameNorm);
+
+    const now = Date.now();
+    transaction(() => {
+      statements.insertProfile.run(
+        profile.id,
+        profile.name,
+        profile.color,
+        profile.createdAt,
+      );
+      writeDefaultSettings(profile.id);
+      if (input?.data) writeProfileData(profile.id, input.data);
+      statements.insertAccount.run(
+        profile.id,
+        input.username,
+        input.usernameNorm,
+        input.passwordHash,
+        now,
+        now,
+      );
+      statements.setMeta.run('active_profile_id', profile.id);
+    });
+
+    return profile;
+  }
+
+  function setPassword(profileId, passwordHash) {
+    const result = statements.updatePassword.run(passwordHash, Date.now(), profileId);
+    if (result.changes === 0) throw new HttpError(404, 'Cuenta no encontrada.');
+  }
+
+  function setPendingTotp(profileId, secret) {
+    const result = statements.setPendingTotp.run(secret, Date.now(), profileId);
+    if (result.changes === 0) throw new HttpError(404, 'Cuenta no encontrada.');
+  }
+
+  function enableTotp(profileId) {
+    const result = statements.enableTotp.run(Date.now(), profileId);
+    if (result.changes === 0) {
+      throw new HttpError(400, 'Primero inicia la configuración del doble factor.');
+    }
+  }
+
+  function disableTotp(profileId) {
+    transaction(() => {
+      statements.disableTotp.run(Date.now(), profileId);
+      statements.deleteRecoveryCodes.run(profileId);
+    });
+  }
+
+  function registerFailedAttempt(profileId) {
+    statements.registerFailure.run(Date.now(), profileId);
+    const account = statements.getAccount.get(profileId);
+    const attempts = Number(account?.failed_attempts ?? 1);
+    const lockMs = lockDurationMs(attempts);
+    const lockedUntil = lockMs > 0 ? Date.now() + lockMs : 0;
+    if (lockedUntil > 0) {
+      statements.setLock.run(lockedUntil, Date.now(), profileId);
+    }
+    return { attempts, lockedUntil };
+  }
+
+  function resetFailedAttempts(profileId) {
+    statements.resetFailures.run(Date.now(), profileId);
+  }
+
+  function replaceRecoveryCodes(profileId, hashes) {
+    transaction(() => {
+      statements.deleteRecoveryCodes.run(profileId);
+      for (const hash of hashes) {
+        statements.insertRecoveryCode.run(profileId, hash);
+      }
+    });
+  }
+
+  function consumeRecoveryCode(profileId, hash) {
+    const result = statements.useRecoveryCode.run(Date.now(), profileId, hash);
+    return result.changes > 0;
+  }
+
+  function countUnusedRecoveryCodes(profileId) {
+    return Number(statements.countRecoveryCodes.get(profileId)?.total ?? 0);
+  }
+
+  function createSession({ tokenHash, profileId, ttlMs }) {
+    const now = Date.now();
+    const expiresAt = now + ttlMs;
+    transaction(() => {
+      statements.deleteExpiredSessions.run(now);
+      statements.insertSession.run(tokenHash, profileId, now, expiresAt, now);
+    });
+    return { expiresAt };
+  }
+
+  function getSession(tokenHash) {
+    const row = statements.getSession.get(tokenHash);
+    if (!row) return null;
+
+    const now = Date.now();
+    if (row.expires_at <= now) {
+      statements.deleteSession.run(tokenHash);
+      return null;
+    }
+
+    const profile = statements.getProfile.get(row.profile_id);
+    if (!profile) {
+      statements.deleteSession.run(tokenHash);
+      return null;
+    }
+
+    statements.touchSession.run(now, tokenHash);
+    return {
+      profileId: row.profile_id,
+      user: rowToProfile(profile),
+      expiresAt: row.expires_at,
+    };
+  }
+
+  function deleteSession(tokenHash) {
+    statements.deleteSession.run(tokenHash);
+  }
+
+  function deleteSessionsForProfile(profileId) {
+    statements.deleteSessionsForProfile.run(profileId);
+  }
+
+  function deleteOtherSessions(profileId, keepTokenHash) {
+    statements.deleteOtherSessions.run(profileId, keepTokenHash);
+  }
+
+  function getWorkspaceForProfile(profileId) {
+    const row = statements.getProfile.get(profileId);
+    if (!row) throw new HttpError(404, 'Perfil no encontrado.');
+    const user = rowToProfile(row);
+    return {
+      users: [user],
+      activeUserId: user.id,
+      data: { [user.id]: readProfileData(user.id) },
+    };
+  }
+
+  /** Elimina un perfil (incluido el último) junto con su cuenta y sesiones. */
+  function deleteProfileAccount(profileId) {
+    if (!statements.getProfile.get(profileId)) {
+      throw new HttpError(404, 'Perfil no encontrado.');
+    }
+    return transaction(() => {
+      statements.deleteSessionsForProfile.run(profileId);
+      statements.deleteProfile.run(profileId);
+
+      const active = statements.getMeta.get('active_profile_id')?.value;
+      if (active === profileId || !statements.getProfile.get(active ?? '')) {
+        const first = statements.listProfiles.all()[0];
+        if (first) statements.setMeta.run('active_profile_id', first.id);
+        else statements.deleteMeta.run('active_profile_id');
+      }
+      return getActiveUserId();
+    });
+  }
+
   return {
     path: filePath,
     countProfiles,
@@ -622,6 +981,27 @@ export function createRepository(filePath) {
     getProfileData,
     saveProfileData,
     importWorkspace,
+    getAccount,
+    getAccountByUsername,
+    listAccountSummaries,
+    createAccount,
+    createProfileWithAccount,
+    setPassword,
+    setPendingTotp,
+    enableTotp,
+    disableTotp,
+    registerFailedAttempt,
+    resetFailedAttempts,
+    replaceRecoveryCodes,
+    consumeRecoveryCode,
+    countUnusedRecoveryCodes,
+    createSession,
+    getSession,
+    deleteSession,
+    deleteSessionsForProfile,
+    deleteOtherSessions,
+    getWorkspaceForProfile,
+    deleteProfileAccount,
     close() {
       db.close();
     },

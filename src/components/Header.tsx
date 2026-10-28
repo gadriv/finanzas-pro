@@ -13,10 +13,11 @@ interface HeaderProps {
   currencyCode: string;
   onCurrencyChange: (code: string) => void;
   onOpenSettings: () => void;
-  users: UserProfile[];
   activeUser: UserProfile;
-  onSwitchUser: (id: string) => void;
-  onManageUsers: () => void;
+  username: string;
+  onSecurity: () => void;
+  onManageProfiles: () => void;
+  onLogout: () => void;
   backendStatus: BackendStatus;
   syncPending: boolean;
 }
@@ -25,10 +26,11 @@ export function Header({
   currencyCode,
   onCurrencyChange,
   onOpenSettings,
-  users,
   activeUser,
-  onSwitchUser,
-  onManageUsers,
+  username,
+  onSecurity,
+  onManageProfiles,
+  onLogout,
   backendStatus,
   syncPending,
 }: HeaderProps) {
@@ -114,10 +116,11 @@ export function Header({
           </select>
 
           <UserMenu
-            users={users}
             activeUser={activeUser}
-            onSwitchUser={onSwitchUser}
-            onManage={onManageUsers}
+            username={username}
+            onSecurity={onSecurity}
+            onManageProfiles={onManageProfiles}
+            onLogout={onLogout}
           />
 
           <button

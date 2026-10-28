@@ -17,6 +17,11 @@ guardan en una base de datos **SQLite** local mediante un pequeño servidor Node
 - Búsqueda y filtros por tipo y categoría en el historial.
 - Multimoneda (CRC, USD, MXN, EUR, COP, ARS, CLP, PEN, GTQ, HNL, NIO, DOP).
 - Perfiles independientes: cada perfil guarda sus propios movimientos, moneda y presupuestos.
+- Acceso por perfil con nombre de usuario y contraseña (scrypt) y sesiones en cookie
+  `httpOnly`.
+- Verificación en dos pasos (2FA) opcional con aplicación autenticadora (TOTP), código QR y
+  códigos de recuperación de un solo uso.
+- Bloqueo temporal tras varios intentos fallidos y límite de intentos por IP.
 - Persistencia en SQLite con guardado atómico por perfil y espejo local en el navegador.
 - Modo sin conexión: si el servidor no responde, la app sigue funcionando con la copia local
   y sincroniza automáticamente los cambios al reconectar.
@@ -40,6 +45,38 @@ npm run dev
 
 `npm run dev` levanta la API SQLite en `http://127.0.0.1:4174` y la interfaz Vite en
 `http://localhost:5173` (abre esta última). El proxy de Vite reenvía `/api` al servidor.
+
+La primera vez que abras la app se te pedirá crear la cuenta del primer perfil (nombre de
+usuario, contraseña y, opcionalmente, datos de ejemplo).
+
+## Acceso y seguridad
+
+Cada perfil es una cuenta independiente y solo ve sus propios datos.
+
+- **Contraseñas**: se guardan con `scrypt` (N=16384, r=8, p=1) y una sal aleatoria por
+  cuenta; nunca se almacenan en claro ni se devuelven al cliente. Mínimo 8 caracteres, con
+  letra y número, y sin poder contener el nombre de usuario.
+- **Sesiones**: el token se genera con 32 bytes aleatorios y viaja en una cookie
+  `finanzas_session` `HttpOnly`, `SameSite=Strict` y `Secure` cuando la conexión es HTTPS.
+  En la base solo se guarda su hash SHA-256. Dura 12 horas, o 30 días si marcas
+  «Mantener la sesión en este equipo».
+- **2FA (TOTP)**: activable desde **Cuenta y seguridad**. Genera un secreto base32, muestra
+  un código QR compatible con Google Authenticator, Authy o 1Password y entrega 8 códigos
+  de recuperación de un solo uso (también descargables en `.txt`). El código se acepta en
+  la ventana actual y las adyacentes (±30 s).
+- **Bloqueo**: tras 5 fallos la cuenta se bloquea de forma progresiva (1, 2, 4, 8 y hasta
+  15 minutos) y responde `429` con `Retry-After`. Además hay un tope de 40 intentos cada
+  5 minutos por IP.
+- **Aislamiento**: todas las rutas de datos exigen sesión y el servidor solo devuelve el
+  perfil de esa sesión; pedir el perfil de otra cuenta responde `404`/`403`.
+- **Cierre de sesión**: invalida el token en SQLite, borra la cookie y elimina el espejo
+  local del navegador para que no queden datos visibles sin autenticarse.
+- **Perfiles antiguos**: si la base ya tenía perfiles sin credenciales, al abrir la app se
+  ofrece «reclamarlos» conservando sus movimientos. Un perfil se puede eliminar solo tras
+  confirmar la contraseña de esa misma cuenta.
+
+> El servidor escucha en `127.0.0.1` por defecto. Si lo expones en red, hazlo detrás de
+> HTTPS (por ejemplo, un proxy inverso) para que la cookie viaje con `Secure`.
 
 ## Producción
 
@@ -74,33 +111,36 @@ npm test
 ```
 
 Las pruebas cubren fechas, cálculos financieros, formato de moneda, presupuestos, datos de
-ejemplo, validación de respaldos, perfiles, el espejo local y el repositorio SQLite
-(aislamiento por perfil, saneamiento de datos y persistencia en archivo).
+ejemplo, validación de respaldos, perfiles, el espejo local, el repositorio SQLite
+(aislamiento por perfil, saneamiento de datos y persistencia en archivo), las utilidades de
+seguridad (scrypt, TOTP según la RFC 6238, códigos de recuperación y tokens de sesión) y las
+reglas de acceso del cliente.
 
-El flujo completo también se verificó con pruebas de extremo a extremo: alta, edición,
-borrado y deshacer movimientos; cambio de moneda; creación, renombrado y borrado de
-perfiles; exportación e importación de respaldos; modo sin conexión con resincronización;
-y la vista móvil.
+El flujo completo también se verificó con pruebas de extremo a extremo: alta y reclamo de
+perfiles, login con contraseña y con 2FA, códigos de recuperación, cambio de contraseña,
+permisos entre perfiles, bloqueo por intentos, cierre de sesión, alta/edición/borrado de
+movimientos, exportación e importación de respaldos, modo sin conexión con resincronización y
+la vista móvil.
 
 ## Perfiles y persistencia
 
-La app permite varios perfiles (por ejemplo, personal, trabajo o familia). Cada perfil
-mantiene sus propios movimientos, moneda y presupuestos; al cambiar de perfil se cargan
-sus datos y el resto queda intacto.
+La app permite varios perfiles (por ejemplo, personal, trabajo o familia). Cada perfil tiene
+su propio usuario y contraseña, y mantiene sus propios movimientos, moneda y presupuestos.
 
+- Una sesión pertenece a un único perfil. Para usar otro perfil se cierra sesión y se
+  introduce su contraseña (y su código 2FA si lo tiene activo).
 - SQLite es la fuente de verdad. Cada guardado reemplaza de forma atómica los movimientos
   y ajustes del perfil dentro de una transacción.
-- `localStorage` se conserva como **espejo y respaldo de emergencia**. Si la API no está
-  disponible, la app arranca en «Modo local», guarda los cambios en el navegador y los
-  encola en `finanzapro.v3.pendingSync`.
-- Al reconectar (botón **Reintentar**, al enfocar la ventana o cada 15 s) los perfiles
+- `localStorage` se conserva como **espejo y respaldo de emergencia** de la sesión activa.
+  Si la API no está disponible, la app guarda los cambios en el navegador y los encola en
+  `finanzapro.v3.pendingSync`.
+- Al reconectar (botón **Reintentar**, al enfocar la ventana o cada 15 s) los cambios
   pendientes se envían a SQLite y la cola se limpia.
 - Crear, renombrar o eliminar perfiles requiere conexión, para evitar conflictos de
   identidad entre el navegador y la base de datos.
+- Al cerrar sesión se borra el espejo local, así que no quedan datos visibles sin acceso.
 - Los cambios se sincronizan entre pestañas del mismo navegador mediante eventos de
   `localStorage`.
-- Al actualizar desde la versión anterior, los datos de `finanzapro.v2.*` se migran
-  automáticamente a SQLite (perfil «Mi cuenta») la primera vez que se conecta.
 - Si los datos de un perfil están corruptos, se guarda una copia en cuarentena
   (`finanzapro.v3.user.<id>.corrupt.<timestamp>`) y el perfil arranca vacío.
 
@@ -109,6 +149,10 @@ sus datos y el resto queda intacto.
 El archivo se crea en `data/finanzapro.db` (ignorado por git) con modo WAL y estas tablas:
 
 - `profiles` — identificador, nombre, color y fecha de creación.
+- `accounts` — credenciales de cada perfil: usuario normalizado único, hash `scrypt`, secreto
+  TOTP, estado del 2FA, fallos acumulados y bloqueo.
+- `sessions` — hash del token, perfil, caducidad y último uso.
+- `recovery_codes` — hashes de los códigos de recuperación y cuándo se usaron.
 - `settings` — moneda y meta de ahorro por perfil.
 - `budgets` — presupuesto por categoría y perfil.
 - `transactions` — movimientos; la clave primaria es `(profile_id, id)`, así que los
@@ -117,17 +161,27 @@ El archivo se crea en `data/finanzapro.db` (ignorado por git) con modo WAL y est
 
 ### API
 
-| Método   | Ruta                     | Descripción                          |
-| -------- | ------------------------ | ------------------------------------ |
-| `GET`    | `/api/health`            | Estado del servidor y de la base.    |
-| `GET`    | `/api/session`           | Perfiles, perfil activo y sus datos. |
-| `POST`   | `/api/profiles`          | Crea un perfil.                      |
-| `PATCH`  | `/api/profiles/:id`      | Renombra un perfil.                  |
-| `DELETE` | `/api/profiles/:id`      | Elimina un perfil (nunca el último). |
-| `PUT`    | `/api/active-profile`    | Cambia el perfil activo.             |
-| `GET`    | `/api/profiles/:id/data` | Datos de un perfil.                  |
-| `PUT`    | `/api/profiles/:id/data` | Guarda movimientos y ajustes.        |
-| `POST`   | `/api/import`            | Importa un workspace si la base está vacía. |
+Todas las rutas salvo `health` y `auth/state` requieren sesión.
+
+| Método   | Ruta                          | Descripción                                         |
+| -------- | ----------------------------- | --------------------------------------------------- |
+| `GET`    | `/api/health`                 | Estado del servidor y de la base.                   |
+| `GET`    | `/api/auth/state`             | Perfiles y si hace falta configurar el primero.     |
+| `POST`   | `/api/auth/setup`             | Crea el primer perfil con sus credenciales.         |
+| `POST`   | `/api/auth/claim`             | Añade credenciales a un perfil antiguo.             |
+| `POST`   | `/api/auth/login`             | Inicia sesión (contraseña + TOTP o recuperación).   |
+| `POST`   | `/api/auth/logout`            | Cierra la sesión actual.                            |
+| `GET`    | `/api/auth/session`           | Perfil, workspace y estado de la cuenta.            |
+| `POST`   | `/api/auth/password`          | Cambia la contraseña y cierra las demás sesiones.   |
+| `POST`   | `/api/auth/totp/setup`        | Genera el secreto y la URL `otpauth://`.            |
+| `POST`   | `/api/auth/totp/enable`       | Confirma el código y entrega códigos de recuperación. |
+| `POST`   | `/api/auth/totp/disable`      | Desactiva el 2FA con contraseña y código.           |
+| `POST`   | `/api/auth/recovery-codes`    | Regenera los códigos de recuperación.               |
+| `POST`   | `/api/profiles`               | Crea un perfil protegido e inicia su sesión.        |
+| `PATCH`  | `/api/profiles/:id`           | Renombra el perfil de la sesión.                    |
+| `DELETE` | `/api/profiles/:id`           | Elimina el perfil de la sesión (pide contraseña).   |
+| `GET`    | `/api/profiles/:id/data`      | Datos del perfil de la sesión.                      |
+| `PUT`    | `/api/profiles/:id/data`      | Guarda movimientos y ajustes.                       |
 
 ### Respaldos
 
@@ -145,34 +199,39 @@ El archivo se crea en `data/finanzapro.db` (ignorado por git) con modo WAL y est
 ## Tecnologías
 
 React 18 · TypeScript · Vite · Tailwind CSS · Recharts · Lucide Icons · Express 5 ·
-SQLite (`node:sqlite`).
+SQLite (`node:sqlite`) · scrypt y TOTP (`node:crypto`) · `qrcode.react`.
 
 ## Estructura
 
 ```
 server/
+├── auth.mjs            # scrypt, TOTP, códigos de recuperación y sesiones
+├── auth.test.mjs       # Pruebas de criptografía y TOTP
 ├── db.mjs              # Esquema, validación y repositorio SQLite
 ├── db.test.mjs         # Pruebas del repositorio
-└── index.mjs           # API Express y servicio de archivos estáticos
+└── index.mjs           # API Express, autenticación y estáticos
 
 scripts/
 └── dev.mjs             # Arranca API + Vite en desarrollo
 
 src/
-├── components/         # UI: tarjetas, formularios, gráficos, modales
+├── components/         # UI: acceso, seguridad, tarjetas, formularios, gráficos
 ├── data/               # Categorías, monedas y datos de ejemplo
-├── hooks/              # Estado, hidratación desde SQLite y sincronización
+├── hooks/              # Sesión, estado financiero e hidratación desde SQLite
 ├── lib/                # Fechas, formato, cálculos, API y almacenamiento local
-├── App.tsx             # Composición de la aplicación
+├── App.tsx             # Composición y control de acceso
 ├── main.tsx            # Punto de entrada
 └── index.css           # Tailwind + utilidades
 ```
 
 ## Notas
 
-- El servidor escucha solo en `127.0.0.1` por defecto. No hay autenticación: si lo expones
-  en red, cualquiera con acceso puede leer y modificar los datos.
+- El servidor escucha solo en `127.0.0.1` por defecto. Si lo expones en red, usa HTTPS y
+  revisa el bloqueo de intentos y la cookie `Secure`.
 - El respaldo JSON incluye el nombre del perfil exportado, sus transacciones y sus
   preferencias; también es compatible con el formato de sólo transacciones (arreglo JSON).
+  No incluye contraseñas ni secretos 2FA.
 - Exporta un respaldo periódicamente: el espejo del navegador no sustituye a una copia de
   la base de datos.
+- Si olvidas la contraseña de un perfil no hay recuperación automática: los datos siguen en
+  SQLite y puedes restaurar un respaldo, pero no se puede revertir el hash.

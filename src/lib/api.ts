@@ -8,10 +8,10 @@ export interface Workspace {
 }
 
 export interface CreateProfileInput {
-  id?: string;
   name: string;
   color?: string;
-  createdAt?: number;
+  username: string;
+  password: string;
 }
 
 export interface HealthResponse {
@@ -19,6 +19,62 @@ export interface HealthResponse {
   database: string;
   file: string;
   profiles: number;
+  auth: string;
+}
+
+/** Perfil visible en la pantalla de acceso (sin datos financieros). */
+export interface AuthProfileSummary {
+  id: string;
+  name: string;
+  color: string;
+  username: string | null;
+  hasPassword: boolean;
+  totpEnabled: boolean;
+  lockedUntil: number;
+}
+
+export interface AuthStateResponse {
+  needsSetup: boolean;
+  profiles: AuthProfileSummary[];
+}
+
+export interface AuthSession {
+  user: UserProfile;
+  workspace: Workspace;
+  account: {
+    username: string;
+    totpEnabled: boolean;
+  };
+}
+
+export interface LoginInput {
+  username: string;
+  password: string;
+  code?: string;
+  recoveryCode?: string;
+  remember?: boolean;
+}
+
+export interface SetupInput {
+  name: string;
+  username: string;
+  password: string;
+  data?: UserData;
+}
+
+export interface ClaimInput {
+  profileId: string;
+  username: string;
+  password: string;
+}
+
+export interface TotpSetupResponse {
+  secret: string;
+  otpauthUrl: string;
+}
+
+export interface RecoveryCodesResponse {
+  recoveryCodes: string[];
 }
 
 const BASE = (import.meta.env.VITE_API_URL ?? '/api').replace(/\/+$/, '');
@@ -38,6 +94,10 @@ export function isNetworkError(error: unknown): boolean {
   return (
     error instanceof ApiError && (error.status === 0 || error.status >= 500)
   );
+}
+
+export function isUnauthorized(error: unknown): boolean {
+  return error instanceof ApiError && error.status === 401;
 }
 
 export function describeApiError(error: unknown): string {
@@ -60,6 +120,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     response = await fetch(`${BASE}${path}`, {
       ...init,
       headers,
+      credentials: 'same-origin',
       signal: controller.signal,
     });
   } catch {
@@ -92,12 +153,92 @@ export function getHealth(): Promise<HealthResponse> {
   return request<HealthResponse>('/health');
 }
 
-export function getSession(): Promise<Workspace> {
-  return request<Workspace>('/session');
+/* ------------------------------------------------------------------ */
+/* Autenticación                                                       */
+/* ------------------------------------------------------------------ */
+
+export function getAuthState(): Promise<AuthStateResponse> {
+  return request<AuthStateResponse>('/auth/state');
 }
 
-export function createProfile(input: CreateProfileInput): Promise<{ user: UserProfile }> {
-  return request<{ user: UserProfile }>('/profiles', {
+export function login(input: LoginInput): Promise<AuthSession> {
+  return request<AuthSession>('/auth/login', {
+    method: 'POST',
+    body: JSON.stringify(input),
+  });
+}
+
+export function setupAccount(input: SetupInput): Promise<AuthSession> {
+  return request<AuthSession>('/auth/setup', {
+    method: 'POST',
+    body: JSON.stringify(input),
+  });
+}
+
+export function claimProfile(input: ClaimInput): Promise<AuthSession> {
+  return request<AuthSession>('/auth/claim', {
+    method: 'POST',
+    body: JSON.stringify(input),
+  });
+}
+
+export function logout(): Promise<void> {
+  return request<void>('/auth/logout', { method: 'POST' });
+}
+
+export function getAuthSession(): Promise<AuthSession> {
+  return request<AuthSession>('/auth/session');
+}
+
+export function changePassword(
+  currentPassword: string,
+  newPassword: string,
+): Promise<{ ok: boolean }> {
+  return request<{ ok: boolean }>('/auth/password', {
+    method: 'POST',
+    body: JSON.stringify({ currentPassword, newPassword }),
+  });
+}
+
+export function startTotpSetup(password: string): Promise<TotpSetupResponse> {
+  return request<TotpSetupResponse>('/auth/totp/setup', {
+    method: 'POST',
+    body: JSON.stringify({ password }),
+  });
+}
+
+export function enableTotp(code: string): Promise<RecoveryCodesResponse> {
+  return request<RecoveryCodesResponse>('/auth/totp/enable', {
+    method: 'POST',
+    body: JSON.stringify({ code }),
+  });
+}
+
+export function disableTotp(
+  password: string,
+  code: string,
+): Promise<{ ok: boolean }> {
+  return request<{ ok: boolean }>('/auth/totp/disable', {
+    method: 'POST',
+    body: JSON.stringify({ password, code }),
+  });
+}
+
+export function regenerateRecoveryCodes(
+  password: string,
+): Promise<RecoveryCodesResponse> {
+  return request<RecoveryCodesResponse>('/auth/recovery-codes', {
+    method: 'POST',
+    body: JSON.stringify({ password }),
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/* Perfiles y datos                                                    */
+/* ------------------------------------------------------------------ */
+
+export function createProfile(input: CreateProfileInput): Promise<AuthSession> {
+  return request<AuthSession>('/profiles', {
     method: 'POST',
     body: JSON.stringify(input),
   });
@@ -113,16 +254,10 @@ export function renameProfile(
   });
 }
 
-export function deleteProfile(userId: string): Promise<Workspace> {
-  return request<Workspace>(`/profiles/${encodeURIComponent(userId)}`, {
+export function deleteProfile(userId: string, password: string): Promise<void> {
+  return request<void>(`/profiles/${encodeURIComponent(userId)}`, {
     method: 'DELETE',
-  });
-}
-
-export function setActiveProfile(userId: string): Promise<{ activeUserId: string }> {
-  return request<{ activeUserId: string }>('/active-profile', {
-    method: 'PUT',
-    body: JSON.stringify({ userId }),
+    body: JSON.stringify({ password }),
   });
 }
 
@@ -137,16 +272,5 @@ export function saveProfileData(
   return request<{ updatedAt: number }>(`/profiles/${encodeURIComponent(userId)}/data`, {
     method: 'PUT',
     body: JSON.stringify(data),
-  });
-}
-
-export function importWorkspace(workspace: {
-  users: UserProfile[];
-  activeUserId: string;
-  data: Record<string, UserData>;
-}): Promise<Workspace> {
-  return request<Workspace>('/import', {
-    method: 'POST',
-    body: JSON.stringify(workspace),
   });
 }

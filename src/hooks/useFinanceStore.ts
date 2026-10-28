@@ -10,22 +10,14 @@ import type {
 import { DEFAULT_SETTINGS } from '../data/categories';
 import { buildSeedTransactions } from '../data/seed';
 import { uid } from '../lib/format';
-import { isProfileNameTaken, sanitizeProfileName } from '../lib/profiles';
+import { sanitizeProfileName } from '../lib/profiles';
 import {
-  ACTIVE_USER_KEY,
-  USERS_KEY,
-  buildProfile,
-  initSession,
-  loadActiveUserId,
-  loadProfiles,
   loadUserData,
-  removeUserData,
   saveActiveUserId,
   saveProfiles,
   saveUserData,
   serializeUserData,
   userDataKey,
-  type Session,
 } from '../lib/userStorage';
 import * as api from '../lib/api';
 import {
@@ -45,42 +37,48 @@ export interface TransactionInput {
   description: string;
 }
 
-let cachedSession: Session | null = null;
-
-/** La sesión local se calcula una sola vez para evitar dobles migraciones. */
-function getInitialSession(): Session {
-  if (!cachedSession) cachedSession = initSession();
-  return cachedSession;
-}
-
 const LOCAL_SAVE_ERROR =
   'No se pudieron guardar los cambios en este navegador. Exporta un respaldo desde Ajustes.';
 const OFFLINE_MESSAGE =
   'No se pudo conectar con SQLite. La app usa la copia local y sincronizará los cambios al reconectar.';
-const PROFILE_OFFLINE_ERROR =
-  'Gestionar perfiles requiere conexión con SQLite. Reintenta cuando el servidor esté disponible.';
 
-export function useFinanceStore() {
-  const boot = getInitialSession();
+interface StoreOptions {
+  /** La sesión dejó de ser válida (expiró o se cerró en otro dispositivo). */
+  onUnauthorized: () => void;
+}
 
-  const [users, setUsers] = useState<UserProfile[]>(boot.users);
-  const [activeUserId, setActiveUserId] = useState<string>(boot.activeUserId);
-  const [transactions, setTransactions] = useState<Transaction[]>(boot.transactions);
-  const [settings, setSettings] = useState<Settings>(boot.settings);
+/**
+ * Estado financiero del perfil autenticado.
+ *
+ * El servidor solo devuelve el perfil de la sesión, así que aquí siempre hay
+ * un único usuario. La copia en localStorage sirve para seguir trabajando si
+ * SQLite deja de responder durante la sesión.
+ */
+export function useFinanceStore(session: api.AuthSession, options: StoreOptions) {
+  const initialUser = session.user;
+  const initialData: UserData = session.workspace.data[initialUser.id] ?? {
+    transactions: [],
+    settings: DEFAULT_SETTINGS,
+  };
+
+  const [users, setUsers] = useState<UserProfile[]>([initialUser]);
+  const [activeUserId, setActiveUserId] = useState<string>(initialUser.id);
+  const [transactions, setTransactions] = useState<Transaction[]>(
+    initialData.transactions,
+  );
+  const [settings, setSettings] = useState<Settings>(initialData.settings);
   const [backendStatus, setBackendStatus] = useState<BackendStatus>('connecting');
   const [syncPending, setSyncPending] = useState(
     () => getPendingProfileIds().length > 0,
   );
   const [storageError, setStorageError] = useState<string | null>(null);
-  const [bootNotice, setBootNotice] = useState<string | undefined>(boot.notice);
+  const [bootNotice, setBootNotice] = useState<string | undefined>(undefined);
 
-  const dataOwnerRef = useRef<string>(boot.activeUserId);
-  const localSnapshotRef = useRef<string>(
-    serializeUserData({ transactions: boot.transactions, settings: boot.settings }),
-  );
-  const serverSnapshotRef = useRef<string>('');
-  const usersRef = useRef<UserProfile[]>(users);
-  const activeUserIdRef = useRef<string>(activeUserId);
+  const dataOwnerRef = useRef<string>(initialUser.id);
+  const localSnapshotRef = useRef<string>(serializeUserData(initialData));
+  const serverSnapshotRef = useRef<string>(serializeUserData(initialData));
+  const usersRef = useRef<UserProfile[]>([initialUser]);
+  const activeUserIdRef = useRef<string>(initialUser.id);
   const backendStatusRef = useRef<BackendStatus>('connecting');
   const pendingRef = useRef<Set<string>>(new Set(getPendingProfileIds()));
   const connectingRef = useRef(false);
@@ -89,7 +87,9 @@ export function useFinanceStore() {
   /** Sube con cada cambio local para no pisarlo con una lectura antigua de SQLite. */
   const dataVersionRef = useRef(0);
 
-  // Mantener refs sincronizadas para usarlas dentro de callbacks asíncronos.
+  const unauthorizedRef = useRef(options.onUnauthorized);
+  unauthorizedRef.current = options.onUnauthorized;
+
   usersRef.current = users;
   activeUserIdRef.current = activeUserId;
   backendStatusRef.current = backendStatus;
@@ -99,54 +99,55 @@ export function useFinanceStore() {
     setBackendStatus(status);
   }, []);
 
+  const handleAuthError = useCallback((error: unknown): boolean => {
+    if (!api.isUnauthorized(error)) return false;
+    unauthorizedRef.current();
+    return true;
+  }, []);
+
   const reportApiFailure = useCallback(
     (error: unknown) => {
+      if (handleAuthError(error)) return;
       setStorageError(api.describeApiError(error));
       if (api.isNetworkError(error)) updateBackendStatus('offline');
     },
-    [updateBackendStatus],
+    [handleAuthError, updateBackendStatus],
   );
 
-  /** Aplica en React y en localStorage un workspace confirmado por SQLite. */
-  const hydrate = useCallback(
-    (workspace: api.Workspace, options?: { notice?: string }): boolean => {
-      const active =
-        workspace.users.find((user) => user.id === workspace.activeUserId) ??
-        workspace.users[0];
-      if (!active) return false;
+  /** Aplica un workspace confirmado por SQLite (un solo perfil). */
+  const hydrate = useCallback((workspace: api.Workspace): boolean => {
+    const active = workspace.users[0];
+    if (!active) return false;
 
-      const data = workspace.data[active.id] ?? {
-        transactions: [],
-        settings: DEFAULT_SETTINGS,
-      };
-      const snapshot = serializeUserData(data);
+    const data = workspace.data[active.id] ?? {
+      transactions: [],
+      settings: DEFAULT_SETTINGS,
+    };
+    const snapshot = serializeUserData(data);
 
-      dataOwnerRef.current = active.id;
-      localSnapshotRef.current = snapshot;
-      serverSnapshotRef.current = snapshot;
-      usersRef.current = workspace.users;
-      activeUserIdRef.current = active.id;
+    dataOwnerRef.current = active.id;
+    localSnapshotRef.current = snapshot;
+    serverSnapshotRef.current = snapshot;
+    usersRef.current = workspace.users;
+    activeUserIdRef.current = active.id;
 
-      setUsers(workspace.users);
-      setActiveUserId(active.id);
-      setTransactions(data.transactions);
-      setSettings(data.settings);
+    setUsers(workspace.users);
+    setActiveUserId(active.id);
+    setTransactions(data.transactions);
+    setSettings(data.settings);
 
-      mirrorWorkspace({
-        users: workspace.users,
-        activeUserId: active.id,
-        data: workspace.data,
-      });
+    mirrorWorkspace({
+      users: workspace.users,
+      activeUserId: active.id,
+      data: workspace.data,
+    });
 
-      pendingRef.current.clear();
-      setSyncPending(false);
-      if (options?.notice) setBootNotice(options.notice);
-      return true;
-    },
-    [],
-  );
+    pendingRef.current.clear();
+    setSyncPending(false);
+    return true;
+  }, []);
 
-  /** Guarda un perfil en SQLite, manteniendo el orden de escrituras por perfil. */
+  /** Guarda un perfil en SQLite, manteniendo el orden de escrituras. */
   const queueSave = useCallback(
     (userId: string, data: UserData, snapshot: string) => {
       const seq = (saveSeqRef.current[userId] ?? 0) + 1;
@@ -168,6 +169,7 @@ export function useFinanceStore() {
           setStorageError(null);
         } catch (error) {
           if (saveSeqRef.current[userId] !== seq) return;
+          if (handleAuthError(error)) return;
 
           setSyncPending(true);
           setStorageError(api.describeApiError(error));
@@ -175,35 +177,10 @@ export function useFinanceStore() {
         }
       })();
     },
-    [updateBackendStatus],
+    [handleAuthError, updateBackendStatus],
   );
 
-  /** Carga un perfil desde el espejo local sin tocar SQLite. */
-  const applyLocalUser = useCallback(
-    (userId: string, options?: { persistActive?: boolean }) => {
-      const stored = loadUserData(userId);
-      const data: UserData = stored ?? {
-        transactions: [],
-        settings: DEFAULT_SETTINGS,
-      };
-      const snapshot = serializeUserData(data);
-
-      dataOwnerRef.current = userId;
-      localSnapshotRef.current = snapshot;
-      serverSnapshotRef.current = snapshot;
-      activeUserIdRef.current = userId;
-
-      setActiveUserId(userId);
-      setTransactions(data.transactions);
-      setSettings(data.settings);
-      if (options?.persistActive !== false) saveActiveUserId(userId);
-
-      return { data, snapshot };
-    },
-    [],
-  );
-
-  /** Conecta con SQLite, importa el workspace local o sincroniza pendientes. */
+  /** Reconecta con SQLite, sube pendientes y refresca los datos del servidor. */
   const connect = useCallback(async () => {
     if (connectingRef.current) return;
     connectingRef.current = true;
@@ -212,82 +189,37 @@ export function useFinanceStore() {
 
     try {
       const versionAtStart = dataVersionRef.current;
-      let workspace = await api.getSession();
-      let notice: string | undefined;
 
-      if (workspace.users.length === 0) {
+      const pending = getPendingProfileIds();
+      if (pending.length > 0) {
         const local = readLocalWorkspace();
-        if (local.users.length === 0) {
-          throw new api.ApiError('No hay perfiles locales para importar.');
-        }
-
-        try {
-          workspace = await api.importWorkspace({
-            users: local.users,
-            activeUserId: local.activeUserId,
-            data: local.data,
-          });
-        } catch (error) {
-          // Otra pestaña pudo importar primero.
-          if (error instanceof api.ApiError && error.status === 409) {
-            workspace = await api.getSession();
-          } else {
-            throw error;
+        for (const userId of pending) {
+          const data = local.data[userId];
+          if (!data || userId !== activeUserIdRef.current) {
+            clearPendingProfile(userId);
+            pendingRef.current.delete(userId);
+            continue;
           }
-        }
-
-        notice =
-          local.source === 'legacy'
-            ? 'Tus datos anteriores se migraron de localStorage a SQLite.'
-            : local.source === 'v3'
-              ? 'Tus perfiles locales se migraron a SQLite.'
-              : 'Base de datos SQLite creada con datos de ejemplo.';
-      } else {
-        const pending = getPendingProfileIds();
-        if (pending.length > 0) {
-          const local = readLocalWorkspace();
-
-          for (const userId of pending) {
-            const user = local.users.find((item) => item.id === userId);
-            const data = local.data[userId];
-            if (!user || !data) {
-              clearPendingProfile(userId);
-              continue;
-            }
-
-            if (!workspace.users.some((item) => item.id === userId)) {
-              await api.createProfile({
-                id: user.id,
-                name: user.name,
-                color: user.color,
-                createdAt: user.createdAt,
-              });
-            }
-
+          try {
             await api.saveProfileData(userId, data);
             clearPendingProfile(userId);
             pendingRef.current.delete(userId);
-          }
-
-          notice = 'Se sincronizaron los cambios guardados sin conexión con SQLite.';
-        }
-
-        const localActive = activeUserIdRef.current;
-        if (localActive && workspace.users.some((user) => user.id === localActive)) {
-          try {
-            await api.setActiveProfile(localActive);
-          } catch {
-            // El perfil activo es una preferencia; no bloquea la carga.
+          } catch (error) {
+            if (handleAuthError(error)) return;
+            if (error instanceof api.ApiError && error.status === 404) {
+              clearPendingProfile(userId);
+              pendingRef.current.delete(userId);
+              continue;
+            }
+            throw error;
           }
         }
-
-        workspace = await api.getSession();
       }
 
+      let workspace = (await api.getAuthSession()).workspace;
       if (epoch !== epochRef.current) return;
 
-      // Vaciar cambios locales que hayan llegado mientras se consultaba el servidor.
-      // Si el usuario sigue editando, se repite con un límite para no bloquear.
+      // Si el usuario editó mientras se consultaba, reintenta con los datos nuevos.
       let observedVersion = versionAtStart;
       for (let attempt = 0; attempt < 3; attempt += 1) {
         const racePending = getPendingProfileIds();
@@ -302,30 +234,35 @@ export function useFinanceStore() {
               clearPendingProfile(userId);
               continue;
             }
-            await api.saveProfileData(userId, data);
-            clearPendingProfile(userId);
-            pendingRef.current.delete(userId);
+            try {
+              await api.saveProfileData(userId, data);
+              clearPendingProfile(userId);
+              pendingRef.current.delete(userId);
+            } catch (error) {
+              if (handleAuthError(error)) return;
+              if (error instanceof api.ApiError && error.status === 404) {
+                clearPendingProfile(userId);
+                continue;
+              }
+              throw error;
+            }
           }
         }
 
-        workspace = await api.getSession();
+        workspace = (await api.getAuthSession()).workspace;
         if (epoch !== epochRef.current) return;
         observedVersion = dataVersionRef.current;
       }
 
-      if (
-        getPendingProfileIds().length > 0 ||
-        dataVersionRef.current !== observedVersion
-      ) {
-        // No se pudo estabilizar la cola: conserva los datos locales.
+      if (getPendingProfileIds().length > 0 || dataVersionRef.current !== observedVersion) {
         updateBackendStatus('online');
         setSyncPending(getPendingProfileIds().length > 0);
         return;
       }
 
       if (epoch !== epochRef.current) return;
-      if (!hydrate(workspace, { notice })) {
-        throw new api.ApiError('SQLite no devolvió ningún perfil.');
+      if (!hydrate(workspace)) {
+        throw new api.ApiError('SQLite no devolvió el perfil de la sesión.');
       }
 
       updateBackendStatus('online');
@@ -333,6 +270,7 @@ export function useFinanceStore() {
       setSyncPending(getPendingProfileIds().length > 0);
     } catch (error) {
       if (epoch !== epochRef.current) return;
+      if (handleAuthError(error)) return;
 
       if (api.isNetworkError(error)) {
         updateBackendStatus('offline');
@@ -344,9 +282,19 @@ export function useFinanceStore() {
     } finally {
       connectingRef.current = false;
     }
-  }, [hydrate, updateBackendStatus]);
+  }, [handleAuthError, hydrate, updateBackendStatus]);
 
-  // Conexión inicial y reintentos cuando el servidor aún no está listo.
+  // Espejo inicial: deja la copia local lista para el modo sin conexión.
+  useEffect(() => {
+    mirrorWorkspace({
+      users: [initialUser],
+      activeUserId: initialUser.id,
+      data: { [initialUser.id]: initialData },
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Conexión inicial y reintentos cuando el servidor no está listo.
   useEffect(() => {
     void connect();
 
@@ -364,7 +312,7 @@ export function useFinanceStore() {
     };
   }, [connect]);
 
-  // Espejo local de la lista de perfiles y del perfil activo.
+  // Espejo local del perfil.
   useEffect(() => {
     saveProfiles(users);
   }, [users]);
@@ -400,33 +348,10 @@ export function useFinanceStore() {
     queueSave(activeUserId, data, snapshot);
   }, [activeUserId, transactions, settings, queueSave]);
 
-  // Sincronización entre pestañas del mismo navegador.
+  // Sincronización entre pestañas del mismo perfil.
   useEffect(() => {
     const handleStorage = (event: StorageEvent) => {
       if (!event.key) return;
-
-      if (event.key === USERS_KEY) {
-        const nextUsers = loadProfiles();
-        if (!nextUsers) return;
-        usersRef.current = nextUsers;
-        setUsers(nextUsers);
-        if (!nextUsers.some((user) => user.id === activeUserIdRef.current)) {
-          const first = nextUsers[0];
-          if (first) applyLocalUser(first.id);
-        }
-        return;
-      }
-
-      if (event.key === ACTIVE_USER_KEY) {
-        const nextId = loadActiveUserId();
-        if (!nextId || nextId === activeUserIdRef.current) return;
-        const nextUsers = loadProfiles();
-        if (!nextUsers?.some((user) => user.id === nextId)) return;
-        usersRef.current = nextUsers;
-        setUsers(nextUsers);
-        applyLocalUser(nextId, { persistActive: false });
-        return;
-      }
 
       if (event.key === userDataKey(activeUserIdRef.current)) {
         const stored = loadUserData(activeUserIdRef.current);
@@ -457,115 +382,23 @@ export function useFinanceStore() {
 
     window.addEventListener('storage', handleStorage);
     return () => window.removeEventListener('storage', handleStorage);
-  }, [applyLocalUser, queueSave]);
-
-  const switchUser = useCallback(
-    (userId: string): boolean => {
-      if (userId === activeUserIdRef.current) return false;
-      if (!usersRef.current.some((user) => user.id === userId)) return false;
-
-      const { data, snapshot } = applyLocalUser(userId);
-
-      if (backendStatusRef.current === 'online') {
-        void api.setActiveProfile(userId).catch(reportApiFailure);
-
-        if (pendingRef.current.has(userId)) {
-          queueSave(userId, data, snapshot);
-        } else {
-          const requestSnapshot = snapshot;
-          void (async () => {
-            try {
-              const remote = await api.getProfileData(userId);
-              if (activeUserIdRef.current !== userId) return;
-              if (
-                localSnapshotRef.current !== requestSnapshot ||
-                pendingRef.current.has(userId)
-              ) {
-                return;
-              }
-
-              const remoteData: UserData = {
-                transactions: remote.transactions,
-                settings: remote.settings,
-              };
-              const remoteSnapshot = serializeUserData(remoteData);
-
-              dataOwnerRef.current = userId;
-              localSnapshotRef.current = remoteSnapshot;
-              serverSnapshotRef.current = remoteSnapshot;
-              saveUserData(userId, remoteData);
-              setTransactions(remote.transactions);
-              setSettings(remote.settings);
-            } catch (error) {
-              reportApiFailure(error);
-            }
-          })();
-        }
-      }
-
-      return true;
-    },
-    [applyLocalUser, queueSave, reportApiFailure],
-  );
-
-  const createUser = useCallback(
-    async (name: string): Promise<UserProfile | null> => {
-      const candidate = buildProfile(name, usersRef.current);
-      if (
-        !candidate ||
-        isProfileNameTaken(usersRef.current, candidate.name)
-      ) {
-        return null;
-      }
-      if (backendStatusRef.current !== 'online') {
-        setStorageError(PROFILE_OFFLINE_ERROR);
-        return null;
-      }
-
-      try {
-        const { user } = await api.createProfile({
-          name: candidate.name,
-          color: candidate.color,
-        });
-        const nextUsers = [...usersRef.current, user];
-        usersRef.current = nextUsers;
-        setUsers(nextUsers);
-        saveProfiles(nextUsers);
-        saveUserData(user.id, {
-          transactions: [],
-          settings: DEFAULT_SETTINGS,
-        });
-        applyLocalUser(user.id);
-
-        try {
-          await api.setActiveProfile(user.id);
-        } catch (error) {
-          reportApiFailure(error);
-        }
-        return user;
-      } catch (error) {
-        reportApiFailure(error);
-        return null;
-      }
-    },
-    [applyLocalUser, reportApiFailure],
-  );
+  }, [queueSave]);
 
   const renameUser = useCallback(
-    async (userId: string, name: string): Promise<boolean> => {
+    async (name: string): Promise<boolean> => {
       const cleanName = sanitizeProfileName(name);
       if (!cleanName) return false;
-      if (!usersRef.current.some((user) => user.id === userId)) return false;
-      if (isProfileNameTaken(usersRef.current, cleanName, userId)) return false;
       if (backendStatusRef.current !== 'online') {
-        setStorageError(PROFILE_OFFLINE_ERROR);
+        setStorageError(
+          'Cambiar el nombre del perfil requiere conexión con SQLite.',
+        );
         return false;
       }
 
       try {
-        const { user } = await api.renameProfile(userId, cleanName);
+        const { user } = await api.renameProfile(activeUserIdRef.current, cleanName);
         const nextUsers = usersRef.current.map((item) =>
-          item.id === userId ? user : item,
+          item.id === user.id ? user : item,
         );
         usersRef.current = nextUsers;
         setUsers(nextUsers);
@@ -577,30 +410,6 @@ export function useFinanceStore() {
       }
     },
     [reportApiFailure],
-  );
-
-  const deleteUser = useCallback(
-    async (userId: string): Promise<boolean> => {
-      if (usersRef.current.length <= 1) return false;
-      if (!usersRef.current.some((user) => user.id === userId)) return false;
-      if (backendStatusRef.current !== 'online') {
-        setStorageError(PROFILE_OFFLINE_ERROR);
-        return false;
-      }
-
-      try {
-        const workspace = await api.deleteProfile(userId);
-        removeUserData(userId);
-        pendingRef.current.delete(userId);
-        clearPendingProfile(userId);
-        hydrate(workspace);
-        return true;
-      } catch (error) {
-        reportApiFailure(error);
-        return false;
-      }
-    },
-    [hydrate, reportApiFailure],
   );
 
   const addTransaction = useCallback((input: TransactionInput) => {
@@ -669,17 +478,13 @@ export function useFinanceStore() {
     void connect();
   }, [connect]);
 
-  const activeUser =
-    users.find((user) => user.id === activeUserId) ?? users[0];
+  const activeUser = users.find((user) => user.id === activeUserId) ?? users[0];
 
   return {
     users,
     activeUser,
     activeUserId,
-    switchUser,
-    createUser,
     renameUser,
-    deleteUser,
     transactions,
     settings,
     backendStatus,

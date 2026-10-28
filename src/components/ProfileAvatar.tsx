@@ -8,7 +8,7 @@ const SIZES = {
 } as const;
 
 interface ProfileAvatarProps {
-  user: UserProfile;
+  user: Pick<UserProfile, 'name' | 'color'>;
   size?: keyof typeof SIZES;
 }
 

@@ -2,6 +2,9 @@ import type { UserData, UserProfile } from '../types';
 import { DEFAULT_SETTINGS } from '../data/categories';
 import { hasLegacyData } from './storage';
 import {
+  ACTIVE_USER_KEY,
+  USERS_KEY,
+  USER_DATA_PREFIX,
   initSession,
   loadActiveUserId,
   loadProfiles,
@@ -118,4 +121,29 @@ export function mirrorWorkspace(workspace: MirrorWorkspace): void {
     saveUserData(user.id, workspace.data[user.id] ?? emptyData());
     clearPendingProfile(user.id);
   });
+}
+
+/**
+ * Borra la copia local (perfiles, datos y cola de pendientes).
+ * Se usa al cerrar sesión para que los datos no queden visibles sin acceso.
+ */
+export function clearLocalWorkspace(): void {
+  try {
+    const keys: string[] = [];
+    for (let index = 0; index < localStorage.length; index += 1) {
+      const key = localStorage.key(index);
+      if (!key) continue;
+      if (
+        key === USERS_KEY ||
+        key === ACTIVE_USER_KEY ||
+        key === PENDING_KEY ||
+        key.startsWith(USER_DATA_PREFIX)
+      ) {
+        keys.push(key);
+      }
+    }
+    keys.forEach((key) => localStorage.removeItem(key));
+  } catch {
+    // Sin almacenamiento disponible no hay nada que borrar.
+  }
 }

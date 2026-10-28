@@ -1,9 +1,20 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react';
-import { HardDrive, Plus, RefreshCw, ShieldCheck } from 'lucide-react';
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ChangeEvent,
+} from 'react';
+import { HardDrive, Loader2, Plus, RefreshCw, ShieldCheck, Wallet } from 'lucide-react';
 import type { Period, Settings, Toast, Transaction } from './types';
 import { getCurrency } from './data/categories';
 import { useFinanceStore } from './hooks/useFinanceStore';
 import type { TransactionInput } from './hooks/useFinanceStore';
+import { useAuth, type AuthController } from './hooks/useAuth';
+import * as api from './lib/api';
+import { describeApiError } from './lib/api';
+import { clearLocalWorkspace } from './lib/localWorkspace';
 import { getPeriodRange, isWithinRange } from './lib/date';
 import {
   buildBudgetSummary,
@@ -11,11 +22,7 @@ import {
   buildTrend,
   computeTotals,
 } from './lib/analytics';
-import {
-  exportBackup,
-  exportCSV,
-  parseBackup,
-} from './lib/storage';
+import { exportBackup, exportCSV, parseBackup } from './lib/storage';
 import { Header } from './components/Header';
 import { PeriodFilter } from './components/PeriodFilter';
 import { KpiCards } from './components/KpiCards';
@@ -25,7 +32,9 @@ import { TrendChart } from './components/TrendChart';
 import { BudgetPanel } from './components/BudgetPanel';
 import { TransactionList } from './components/TransactionList';
 import { SettingsModal } from './components/SettingsModal';
-import { ProfilesModal } from './components/ProfilesModal';
+import { AccountsModal } from './components/AccountsModal';
+import { SecurityModal } from './components/SecurityModal';
+import { AuthScreen } from './components/AuthScreen';
 import { Modal } from './components/Modal';
 import { ConfirmDialog } from './components/ConfirmDialog';
 import { ToastView } from './components/Toast';
@@ -33,14 +42,68 @@ import { ToastView } from './components/Toast';
 type ConfirmKind = 'reset' | 'clear' | null;
 
 export default function App() {
+  const auth = useAuth();
+  const [switchUsername, setSwitchUsername] = useState('');
+
+  if (auth.status === 'loading') {
+    return (
+      <div className="min-h-screen bg-slate-100 flex flex-col items-center justify-center gap-3">
+        <div className="bg-emerald-600 p-3 rounded-2xl text-white shadow-lg shadow-emerald-600/20">
+          <Wallet className="w-7 h-7" />
+        </div>
+        <p className="text-sm font-bold text-slate-700 flex items-center gap-2">
+          <Loader2 className="w-4 h-4 animate-spin text-emerald-600" />
+          Comprobando sesión…
+        </p>
+      </div>
+    );
+  }
+
+  if (auth.status === 'anonymous' || !auth.session) {
+    return (
+      <AuthScreen
+        profiles={auth.profiles}
+        needsSetup={auth.needsSetup}
+        busy={auth.busy}
+        error={auth.error}
+        initialUsername={switchUsername}
+        onLogin={auth.login}
+        onClaim={auth.claim}
+        onSetup={auth.setup}
+        onClearError={auth.clearError}
+      />
+    );
+  }
+
+  return (
+    <FinanceApp
+      key={auth.session.user.id}
+      auth={auth}
+      session={auth.session}
+      onSwitchProfile={(username) => {
+        setSwitchUsername(username);
+        void auth.logout();
+      }}
+      onSignedOut={() => {
+        setSwitchUsername('');
+        void auth.logout();
+      }}
+    />
+  );
+}
+
+interface FinanceAppProps {
+  auth: AuthController;
+  session: api.AuthSession;
+  onSwitchProfile: (username: string) => void;
+  onSignedOut: () => void;
+}
+
+function FinanceApp({ auth, session, onSwitchProfile, onSignedOut }: FinanceAppProps) {
   const {
-    users,
     activeUser,
     activeUserId,
-    switchUser,
-    createUser,
     renameUser,
-    deleteUser,
     transactions,
     settings,
     backendStatus,
@@ -56,14 +119,15 @@ export default function App() {
     resetDemo,
     clearAll,
     replaceData,
-  } = useFinanceStore();
+  } = useFinanceStore(session, { onUnauthorized: auth.expireSession });
 
   const [period, setPeriod] = useState<Period>('month');
   const [editing, setEditing] = useState<Transaction | null>(null);
   const [quickAddOpen, setQuickAddOpen] = useState(false);
   const [showFab, setShowFab] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [profilesOpen, setProfilesOpen] = useState(false);
+  const [accountsOpen, setAccountsOpen] = useState(false);
+  const [securityOpen, setSecurityOpen] = useState(false);
   const [confirmKind, setConfirmKind] = useState<ConfirmKind>(null);
   const [toast, setToast] = useState<Toast | null>(null);
 
@@ -82,10 +146,7 @@ export default function App() {
     (message: string, kind: Toast['kind'] = 'success', action?: Toast['action']) => {
       if (toastTimer.current) clearTimeout(toastTimer.current);
       setToast({ id: Date.now(), kind, message, action });
-      toastTimer.current = setTimeout(
-        () => setToast(null),
-        action ? 7000 : 4500,
-      );
+      toastTimer.current = setTimeout(() => setToast(null), action ? 7000 : 4500);
     },
     [],
   );
@@ -97,7 +158,6 @@ export default function App() {
     [],
   );
 
-  // Avisos de la sesión: migración de datos y errores de almacenamiento.
   useEffect(() => {
     if (bootNotice) showToast(bootNotice, 'info');
   }, [bootNotice, showToast]);
@@ -222,46 +282,40 @@ export default function App() {
     showToast('Se borraron todas las transacciones', 'info');
   };
 
-  const handleSwitchUser = (userId: string) => {
-    const target = users.find((user) => user.id === userId);
-    if (!switchUser(userId)) return;
-    setEditing(null);
-    setQuickAddOpen(false);
-    setSettingsOpen(false);
-    if (target) showToast(`Perfil activo: ${target.name}`, 'info');
+  const handleLogout = () => {
+    clearLocalWorkspace();
+    onSignedOut();
   };
 
-  const handleCreateUser = async (name: string): Promise<boolean> => {
-    const profile = await createUser(name);
-    if (!profile) return false;
-    setEditing(null);
-    setQuickAddOpen(false);
-    showToast(`Perfil "${profile.name}" creado`);
+  const handleCreateProfile = async (input: {
+    name: string;
+    username: string;
+    password: string;
+  }) => {
+    const next = await api.createProfile(input);
+    auth.acceptSession(next);
+    showToast(`Perfil «${next.user.name}» creado`);
     return true;
   };
 
-  const handleRenameUser = async (
-    userId: string,
-    name: string,
-  ): Promise<boolean> => {
-    if (!(await renameUser(userId, name))) return false;
+  const handleRenameProfile = async (name: string) => {
+    if (!(await renameUser(name))) {
+      showToast('No se pudo renombrar el perfil', 'error');
+      return false;
+    }
     showToast('Perfil renombrado');
     return true;
   };
 
-  const handleDeleteUser = async (userId: string): Promise<boolean> => {
-    const target = users.find((user) => user.id === userId);
-    const wasActive = userId === activeUserId;
-    if (!(await deleteUser(userId))) return false;
-    if (wasActive) {
-      setEditing(null);
-      setQuickAddOpen(false);
-      setSettingsOpen(false);
+  const handleDeleteProfile = async (password: string) => {
+    try {
+      await api.deleteProfile(activeUserId, password);
+    } catch (error) {
+      throw new Error(describeApiError(error));
     }
-    showToast(
-      target ? `Perfil "${target.name}" eliminado` : 'Perfil eliminado',
-      'info',
-    );
+    clearLocalWorkspace();
+    showToast('Perfil eliminado', 'info');
+    onSignedOut();
     return true;
   };
 
@@ -273,10 +327,11 @@ export default function App() {
         currencyCode={settings.currencyCode}
         onCurrencyChange={(code) => updateSettings({ currencyCode: code })}
         onOpenSettings={() => setSettingsOpen(true)}
-        users={users}
         activeUser={activeUser}
-        onSwitchUser={handleSwitchUser}
-        onManageUsers={() => setProfilesOpen(true)}
+        username={session.account.username}
+        onSecurity={() => setSecurityOpen(true)}
+        onManageProfiles={() => setAccountsOpen(true)}
+        onLogout={handleLogout}
         backendStatus={backendStatus}
         syncPending={syncPending}
       />
@@ -375,9 +430,11 @@ export default function App() {
         <footer className="flex items-start gap-2 text-[11px] text-slate-400 px-1 pt-2">
           <ShieldCheck className="w-4 h-4 shrink-0" />
           <p>
-            El perfil <span className="font-semibold text-slate-500">{activeUser.name}</span>{' '}
-            se guarda en SQLite en este equipo y mantiene una copia local en el navegador.
-            Exporta un respaldo periódicamente desde Ajustes para conservar tu historial.
+            El perfil{' '}
+            <span className="font-semibold text-slate-500">{activeUser.name}</span>{' '}
+            (@{session.account.username}) está protegido con contraseña
+            {session.account.totpEnabled ? ' y doble factor' : ''}. Los datos se guardan
+            en SQLite en este equipo y mantienen una copia local en el navegador.
           </p>
         </footer>
       </main>
@@ -416,15 +473,28 @@ export default function App() {
         />
       </Modal>
 
-      <ProfilesModal
-        open={profilesOpen}
-        users={users}
-        activeUserId={activeUserId}
-        onClose={() => setProfilesOpen(false)}
-        onSwitch={handleSwitchUser}
-        onCreate={handleCreateUser}
-        onRename={handleRenameUser}
-        onDelete={handleDeleteUser}
+      <AccountsModal
+        open={accountsOpen}
+        profiles={auth.profiles}
+        currentUserId={activeUserId}
+        onClose={() => setAccountsOpen(false)}
+        onSwitch={onSwitchProfile}
+        onCreate={handleCreateProfile}
+        onRename={handleRenameProfile}
+        onDelete={handleDeleteProfile}
+      />
+
+      <SecurityModal
+        open={securityOpen}
+        user={activeUser}
+        username={session.account.username}
+        totpEnabled={session.account.totpEnabled}
+        onClose={() => setSecurityOpen(false)}
+        onLogout={handleLogout}
+        onChanged={() => {
+          void auth.refresh();
+        }}
+        onNotify={(message, kind) => showToast(message, kind)}
       />
 
       <SettingsModal
