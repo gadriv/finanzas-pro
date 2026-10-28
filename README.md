@@ -25,7 +25,8 @@ guardan en una base de datos **SQLite** local mediante un pequeño servidor Node
 - Persistencia en SQLite con guardado atómico por perfil y espejo local en el navegador.
 - Modo sin conexión: si el servidor no responde, la app sigue funcionando con la copia local
   y sincroniza automáticamente los cambios al reconectar.
-- Exportación JSON/CSV, importación de respaldos.
+- Exportación de reportes del período en PDF y CSV, y de respaldos en JSON/CSV.
+- Importación de respaldos y restauración de datos.
 - Diseño responsive y accesible (navegación por teclado, etiquetas ARIA).
 
 ## Requisitos
@@ -104,6 +105,27 @@ Ejemplo:
 FINANZAPRO_DB=~/respaldos/finanzas.db PORT=4180 npm start
 ```
 
+## Reportes
+
+El botón **Reporte** del panel (junto al selector de período) abre un diálogo para descargar
+el análisis del período seleccionado. El archivo se genera en el navegador: los datos no se
+envían a ningún servicio externo.
+
+- **PDF** (A4, listo para imprimir o compartir): encabezado con perfil, usuario, período y
+  moneda; KPIs; gastos por categoría; evolución mensual de ingresos y gastos; presupuestos del
+  mes; movimientos del período y numeración de páginas. Se genera con `jsPDF` +
+  `jspdf-autotable`, que se cargan solo al pulsar «Descargar PDF» y no forman parte del
+  paquete inicial.
+- **CSV**: las mismas secciones en filas y columnas, con `sep=;`, BOM UTF-8 y coma decimal
+  para abrir directamente en Excel o Google Sheets en español.
+- El nombre del archivo incluye perfil, período y fecha, por ejemplo
+  `finanzapro_ana_maria_reporte_month_2026-10-28.pdf`.
+- En el PDF los importes usan el código ISO de la moneda (`CRC 1 234,56`), porque las fuentes
+  estándar de PDF no incluyen símbolos como `₡`.
+
+Los presupuestos son siempre mensuales, aunque el período del reporte sea diario, semanal o
+anual. Las tablas cortas (categorías y presupuestos) no se parten entre páginas.
+
 ## Pruebas
 
 ```bash
@@ -113,14 +135,14 @@ npm test
 Las pruebas cubren fechas, cálculos financieros, formato de moneda, presupuestos, datos de
 ejemplo, validación de respaldos, perfiles, el espejo local, el repositorio SQLite
 (aislamiento por perfil, saneamiento de datos y persistencia en archivo), las utilidades de
-seguridad (scrypt, TOTP según la RFC 6238, códigos de recuperación y tokens de sesión) y las
-reglas de acceso del cliente.
+seguridad (scrypt, TOTP según la RFC 6238, códigos de recuperación y tokens de sesión), las
+reglas de acceso del cliente y el reporte (resumen del período, CSV y documento PDF).
 
 El flujo completo también se verificó con pruebas de extremo a extremo: alta y reclamo de
 perfiles, login con contraseña y con 2FA, códigos de recuperación, cambio de contraseña,
 permisos entre perfiles, bloqueo por intentos, cierre de sesión, alta/edición/borrado de
-movimientos, exportación e importación de respaldos, modo sin conexión con resincronización y
-la vista móvil.
+movimientos, exportación e importación de respaldos, descarga de reportes PDF y CSV en los
+cinco períodos, modo sin conexión con resincronización y la vista móvil.
 
 ## Perfiles y persistencia
 
@@ -199,7 +221,8 @@ Todas las rutas salvo `health` y `auth/state` requieren sesión.
 ## Tecnologías
 
 React 18 · TypeScript · Vite · Tailwind CSS · Recharts · Lucide Icons · Express 5 ·
-SQLite (`node:sqlite`) · scrypt y TOTP (`node:crypto`) · `qrcode.react`.
+SQLite (`node:sqlite`) · scrypt y TOTP (`node:crypto`) · `qrcode.react` · `jsPDF` y
+`jspdf-autotable` (carga diferida para los reportes).
 
 ## Estructura
 
@@ -218,7 +241,7 @@ src/
 ├── components/         # UI: acceso, seguridad, tarjetas, formularios, gráficos
 ├── data/               # Categorías, monedas y datos de ejemplo
 ├── hooks/              # Sesión, estado financiero e hidratación desde SQLite
-├── lib/                # Fechas, formato, cálculos, API y almacenamiento local
+├── lib/                # Fechas, formato, cálculos, API, reportes PDF/CSV y almacenamiento local
 ├── App.tsx             # Composición y control de acceso
 ├── main.tsx            # Punto de entrada
 └── index.css           # Tailwind + utilidades

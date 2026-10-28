@@ -194,7 +194,7 @@ export function exportBackup(
   );
 }
 
-function fileSlug(name?: string): string {
+export function fileSlug(name?: string): string {
   if (!name) return '';
   const slug = name
     .normalize('NFD')
@@ -217,18 +217,20 @@ export function exportCSV(transactions: Transaction[]): void {
       tx.type === 'income' ? 'Ingreso' : 'Gasto',
       ALL_CATEGORIES.find((c) => c.id === tx.category)?.name ?? tx.category,
       tx.description,
-      tx.amount.toFixed(2),
+      tx.amount.toFixed(2).replace('.', ','),
     ]);
 
-  const csv = [header, ...rows]
-    .map((row) => row.map((cell) => escape(String(cell))).join(','))
+  // Excel en español separa por «;» y usa coma decimal.
+  const body = [header, ...rows]
+    .map((row) => row.map((cell) => escape(String(cell))).join(';'))
     .join('\r\n');
+  const csv = `sep=;\r\n${body}`;
 
   // BOM para que Excel respete los acentos
   downloadFile(`\uFEFF${csv}`, `finanzapro_transacciones_${todayISO()}.csv`, 'text/csv;charset=utf-8');
 }
 
-function downloadFile(content: string, filename: string, mime: string): void {
+export function downloadFile(content: string, filename: string, mime: string): void {
   const blob = new Blob([content], { type: mime });
   const url = URL.createObjectURL(blob);
   const link = document.createElement('a');

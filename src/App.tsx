@@ -34,6 +34,7 @@ import { TransactionList } from './components/TransactionList';
 import { SettingsModal } from './components/SettingsModal';
 import { AccountsModal } from './components/AccountsModal';
 import { SecurityModal } from './components/SecurityModal';
+import { ReportModal } from './components/ReportModal';
 import { AuthScreen } from './components/AuthScreen';
 import { Modal } from './components/Modal';
 import { ConfirmDialog } from './components/ConfirmDialog';
@@ -128,6 +129,7 @@ function FinanceApp({ auth, session, onSwitchProfile, onSignedOut }: FinanceAppP
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [accountsOpen, setAccountsOpen] = useState(false);
   const [securityOpen, setSecurityOpen] = useState(false);
+  const [reportOpen, setReportOpen] = useState(false);
   const [confirmKind, setConfirmKind] = useState<ConfirmKind>(null);
   const [toast, setToast] = useState<Toast | null>(null);
 
@@ -364,7 +366,11 @@ function FinanceApp({ auth, session, onSwitchProfile, onSignedOut }: FinanceAppP
           </div>
         )}
 
-        <PeriodFilter value={period} onChange={setPeriod} />
+        <PeriodFilter
+          value={period}
+          onChange={setPeriod}
+          onExportReport={() => setReportOpen(true)}
+        />
 
         <KpiCards
           totals={totals}
@@ -494,6 +500,17 @@ function FinanceApp({ auth, session, onSwitchProfile, onSignedOut }: FinanceAppP
         onChanged={() => {
           void auth.refresh();
         }}
+        onNotify={(message, kind) => showToast(message, kind)}
+      />
+
+      <ReportModal
+        open={reportOpen}
+        profileName={activeUser.name}
+        username={session.account.username}
+        period={period}
+        transactions={transactions}
+        settings={settings}
+        onClose={() => setReportOpen(false)}
         onNotify={(message, kind) => showToast(message, kind)}
       />
 
